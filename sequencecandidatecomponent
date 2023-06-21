@@ -1,0 +1,1151 @@
+<?php
+
+namespace App\Http\Livewire;
+
+use App\Models\Step;
+use App\Models\SgEvent;
+use App\Models\Candidate;
+use App\Models\CandidateIndentifier;
+use App\Models\CandidateSequence;
+use App\Models\OauthToken;
+
+use Livewire\Component;
+use Livewire\WithPagination;
+use App\Jobs\ZohoSyncCandidate;
+use App\Jobs\InsertSgEvents;
+use Illuminate\Support\Facades\DB;
+use App\Models\CandidateNote;
+use App\Globals\Pipl;
+use Carbon\Carbon;
+use App\Jobs\EnrichCandidate;
+
+class SequenceCandidates extends Component
+{
+    use WithPagination;
+
+    protected $paginationTheme = 'bootstrap';
+
+    public $sequence;
+    public $perPage = 10;
+    public $otherStatus = 0;
+    public $search = '';
+    public $status;
+    public $totalOngoing = 0;
+    public $totalMessaged = 0;
+    public $totalOpened = 0;
+    public $totalReplied = 0;
+    public $totalBounced = 0;
+    public $totalClicked = 0;
+    public $selectedCandidate = null;
+    public $candidateNotes = [];
+    public $workEmail = [];
+    public $workPhone = [];
+    public $personalPhone = [];
+    public $personalEmail = [];
+    public $selectedCandidateSequences = [];
+    public $isverified = null;
+
+    public $first_name;
+    public $last_name;
+    public $primary_email;
+    public $secondary_email;
+    public $phone1;
+    public $mobile_num;
+    public $job_title;
+    public $current_company;
+    public $location;
+    public $showAlert = false;
+    public $totalSteps = 0;
+    public $timezone;
+    public $utc;
+    public $note = "";
+
+    public $cNow = 0;
+    public $cTotal = 0;
+
+    public $selectPage = false;
+    public $selectAll = false;
+    public $checkedCandidates = [];
+    protected $listeners = ['delete','deleteCheckedCandidates', 'setToReplyCandidatesAction', 'setToBouncedCandidatesAction', 'candidateNotes', 'storeNote', 'setToOngoing', 'setToOngoingCandidatesAction'];
+
+    protected function totalCandidates($status = null)
+    {
+        if (!$status) {
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)->count();
+            // return $this->sequence->candidates->count();
+        } else {
+
+            if($status === 'message')
+            {
+                return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)->whereIn('candidate_sequence_status', [2,3,4,6])->count();
+            }
+
+            if($status === 'open')
+            {
+                return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)->whereIn('candidate_sequence_status', [3,4])->count();
+            }
+
+            if($status === 'others')
+            {
+                return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)->whereIn('candidate_sequence_status', [8,9,10])->count();
+            }
+
+            if($status === 'ongoing')
+            {
+                $finalStep = Step::where('sequence_id', $this->sequence->id)->orderBy('order', 'desc')->first();
+                // dd($finalStep);
+                if($finalStep)
+                {
+                    return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+                    ->where(function($query) use ($finalStep){
+                        $query->where('candidate_sequence_current_step_id', '!=', $finalStep->id)->orWhereNull('candidate_sequence_current_step_id');
+                    })
+                    ->whereNotIn('candidate_sequence_status', [4,5,8,9,10])->count();
+                }
+                else
+                {
+                    return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+                    ->where(function($query) use ($finalStep){
+                        $query->whereNull('candidate_sequence_current_step_id');
+                    })
+                    ->whereNotIn('candidate_sequence_status', [4,5,8,9,10])->count();
+                }
+            }
+
+            if($status === 'reply' || $status === 'bounce')
+            {
+                $statusArray['reply'] = 4;
+                $statusArray['bounce'] = 5;
+                $statusArray['message'] = 2;
+
+                return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)->where('candidate_sequence_status', $statusArray[$status])->count();
+            }
+
+            return SgEvent::where('sequence_id',$this->sequence->id)->where('status',$status)->count();
+        }
+    }
+
+    public function mount($sequence)
+    {
+        $this->sequence = $sequence;
+        $this->utc = $sequence->schedule->utc;
+        $this->timezone = $sequence->schedule->timezone;
+
+        $this->totalCandidates = $this->totalCandidates();
+        $this->totalOngoing = $this->totalCandidates('ongoing');;
+        $this->totalMessaged = $this->totalCandidates('message');
+        $this->totalOpened = $this->totalCandidates('open');
+        $this->totalReplied = $this->totalCandidates('reply');
+        $this->totalBounced = $this->totalCandidates('bounce');
+        $this->totalClicked = $this->totalCandidates('click');
+        $this->totalOthers = $this->totalCandidates('others');
+        $this->totalSteps = $this->sequence->steps->count();
+    }
+
+    public function render()
+    {
+        return view('livewire.sequence-candidates',[
+            'candidates' => $this->candidates
+        ]);
+    }
+
+    public function getCandidatesProperty()
+    {
+        return $this->candidatesQuery->paginate($this->perPage);
+    }
+
+    public function getCandidatesQueryProperty()
+    {
+        if($this->status === 2)
+        {
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+            ->search(trim($this->search))
+            ->whereIn('candidate_sequence_status', [2,3,4,6])
+            ->with('candidateStatus')
+            ->orderBy('candidates.id', 'desc');
+        }
+        elseif ($this->status === 1) {
+
+            $finalStep = Step::where('sequence_id', $this->sequence->id)->orderBy('order', 'desc')->first();
+
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+            ->search(trim($this->search))
+            ->where(function($query) use ($finalStep){
+                $query->where('candidate_sequence_current_step_id', '!=', $finalStep->id)->orWhereNull('candidate_sequence_current_step_id');
+            })
+            ->whereNotIn('candidate_sequence_status', [4,5,8,9,10])
+            ->with('candidateStatus')
+            ->orderBy('candidates.id', 'desc');
+        }
+        elseif ($this->status === 3) {
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+            ->search(trim($this->search))
+            ->whereIn('candidate_sequence_status', [3,4])
+            ->with('candidateStatus')
+            ->orderBy('candidates.id', 'desc');
+        }
+        elseif ($this->status === 8) {
+
+            if($this->otherStatus == 0)
+            {
+                // dd($this->otherStatus);
+                return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+                ->search(trim($this->search))
+                ->whereIn('candidate_sequence_status', [8,9,10])
+                ->with('candidateStatus')
+                ->orderBy('candidates.id', 'desc');
+            }
+            else
+            {
+                return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+                ->search(trim($this->search))
+                ->where('candidate_sequence_status', $this->otherStatus)
+                ->with('candidateStatus')
+                ->orderBy('candidates.id', 'desc');
+            }
+
+        }
+        elseif ($this->status === 4) {
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+            ->search(trim($this->search))
+            ->where('candidate_sequence_status', 4)
+            ->with('candidateStatus')
+            ->orderBy('candidates.id', 'desc');
+        }
+        elseif ($this->status === 5) {
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+            ->search(trim($this->search))
+            ->where('candidate_sequence_status', 5)
+            ->with('candidateStatus')
+            ->orderBy('candidates.id', 'desc');
+        }
+        else
+        {
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+            ->search(trim($this->search))
+            ->filterBySgEventStatus($this->status)
+            ->with('candidateStatus')
+            ->orderBy('candidates.id', 'desc');
+        }
+    }
+
+    public function getCandidatesQueryPropertySort()
+    {
+        if($this->status === 2)
+        {
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+            ->search(trim($this->search))
+            ->whereIn('candidate_sequence_status', [2,3,4,6])
+            ->with('candidateStatus');
+            // ->orderBy('candidates.id', 'desc');
+        }
+        elseif ($this->status === 1) {
+
+            $finalStep = Step::where('sequence_id', $this->sequence->id)->orderBy('order', 'desc')->first();
+
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+            ->search(trim($this->search))
+            ->where(function($query) use ($finalStep){
+                $query->where('candidate_sequence_current_step_id', '!=', $finalStep->id)->orWhereNull('candidate_sequence_current_step_id');
+            })
+            ->whereNotIn('candidate_sequence_status', [4,5,8,9,10])
+            ->with('candidateStatus');
+            // ->orderBy('candidates.id', 'desc');
+        }
+        elseif ($this->status === 3) {
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+            ->search(trim($this->search))
+            ->whereIn('candidate_sequence_status', [3,4])
+            ->with('candidateStatus');
+            // ->orderBy('candidates.id', 'desc');
+        }
+        elseif ($this->status === 8) {
+
+            if($this->otherStatus == 0)
+            {
+                // dd($this->otherStatus);
+                return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+                ->search(trim($this->search))
+                ->whereIn('candidate_sequence_status', [8,9,10])
+                ->with('candidateStatus');
+                // ->orderBy('candidates.id', 'desc');
+            }
+            else
+            {
+                return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+                ->search(trim($this->search))
+                ->where('candidate_sequence_status', $this->otherStatus)
+                ->with('candidateStatus');
+                // ->orderBy('candidates.id', 'desc');
+            }
+
+        }
+        elseif ($this->status === 4) {
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+            ->search(trim($this->search))
+            ->where('candidate_sequence_status', 4)
+            ->with('candidateStatus');
+            // ->orderBy('candidates.id', 'desc');
+        }
+        elseif ($this->status === 5) {
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+            ->search(trim($this->search))
+            ->where('candidate_sequence_status', 5)
+            ->with('candidateStatus');
+            // ->orderBy('candidates.id', 'desc');
+        }
+        else
+        {
+            return Candidate::CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)
+            ->search(trim($this->search))
+            ->filterBySgEventStatus($this->status)
+            ->with('candidateStatus');
+            // ->orderBy('candidates.id', 'desc');
+        }
+    }
+
+    public function updating($name, $value)
+    {
+        $changePaginationToOne = ['search','perPage'];
+        return (in_array($name, $changePaginationToOne)) ?  $this->resetPage() : '';
+    }
+
+    public function sortByStatus($status)
+    {
+        $this->status = $status;
+        $this->resetPage();
+    }
+
+    private function resetInputFields()
+    {
+        $this->first_name = '';
+        $this->last_name = '';
+        $this->primary_email = '';
+        $this->secondary_email = '';
+        $this->phone1 = '';
+        $this->mobile_num = '';
+        $this->job_title = '';
+        $this->current_company = '';
+        $this->location = '';
+    }
+
+    public function store()
+    {
+        $validatedData = $this->validate([
+            'first_name' => ['required','min:2'],
+            'last_name' => ['required','min:2'],
+            'primary_email' => ['required','email','unique:candidates,primary_email,NULL,id,sequence_id,'.$this->sequence->id]
+        ]);
+
+        $validatedData['sequence_email'] = $validatedData['primary_email'].$this->sequence->id;
+        $validatedData['sequence_id'] = $this->sequence->id;
+        $validatedData['job_id'] = $this->sequence->job_id;
+        $validatedData['image'] = get_ui_avatar($this->first_name, $this->last_name);
+        $validatedData['secondary_email'] = $this->secondary_email;
+        $validatedData['phone1'] = $this->phone1;
+        $validatedData['mobile_num'] = $this->mobile_num;
+        $validatedData['job_title'] = $this->job_title;
+        $validatedData['current_company'] = $this->current_company;
+        $validatedData['location'] = $this->location;
+        $validatedData['current_step'] = NULL;
+        $validatedData['source'] = 'Talently Outreach Form';
+        $validatedData['type'] = candidate_type();
+
+        if ($this->sequence->zoho_sync)
+        {
+            $zohoCandidatesArr[0]['Source'] = 'Talently Outreach';
+            $zohoCandidatesArr[0]['First_Name'] = $validatedData['first_name'];
+            $zohoCandidatesArr[0]['Last_Name'] = $validatedData['last_name'];
+            $zohoCandidatesArr[0]['Email'] = $validatedData['primary_email'];
+            $zohoCandidatesArr[0]['Secondary_Email'] = $this->secondary_email;
+            $zohoCandidatesArr[0]['Company'] = $this->current_company ?? '';
+            $zohoCandidatesArr[0]['State'] = '';
+            $zohoCandidatesArr[0]['Phone'] = strval($this->phone1 ?? '');
+            $zohoCandidatesArr[0]['Mobile'] = strval($this->mobile_num ?? '');
+
+            $accessToken = OauthToken::getAccessToken();
+            ZohoSyncCandidate::dispatch($this->sequence,$zohoCandidatesArr,$accessToken);
+        }
+
+        $CandidateIndentifier = CandidateIndentifier::whereIn('candidate_identifier_value', [$validatedData['primary_email'], $validatedData['secondary_email']])->first();
+
+        if($CandidateIndentifier)
+        {
+            $candidate = Candidate::where('id', $CandidateIndentifier->candidate_id)->first();
+            $candidate->update($validatedData);
+            $candidateID = $candidate->id;
+        }
+        else
+        {
+            $candidateID = Candidate::insertGetId($validatedData);
+        }
+
+        $candidate = Candidate::find($candidateID);
+
+        if($validatedData['primary_email'])
+        {
+            $tempIdentifier = [
+                'candidate_id' => $candidate->id,
+                'candidate_identifier_value' => $validatedData['primary_email'],
+                'candidate_identifier_name' => 'primary_email'
+            ];
+            CandidateIndentifier::updateOrCreate(['candidate_identifier_value' => $validatedData['primary_email']], $tempIdentifier);
+        }
+
+        if($validatedData['secondary_email'])
+        {
+            $tempIdentifier = [
+                'candidate_id' => $candidate->id,
+                'candidate_identifier_value' => $validatedData['secondary_email'],
+                'candidate_identifier_name' => 'secondary_email'
+            ];
+            CandidateIndentifier::updateOrCreate(['candidate_identifier_value' => $validatedData['secondary_email']], $tempIdentifier);
+        }
+
+        CandidateSequence::updateOrCreate([
+            'candidate_id' => $candidate->id,
+            'sequence_id' => $this->sequence->id
+        ],[
+            'candidate_sequence_status' => 1,
+            'candidate_sequence_current_step' => null,
+            'candidate_sequence_current_step_id' => null,
+            'candidate_sequence_last_sent_date' => null,
+        ]);
+
+
+        $this->resetInputFields();
+        $this->showAlert = true;
+
+        session()->flash('message', candidate_type().' Created Successfully.');
+
+        $this->emit('closeCreateCandidateModal');
+    }
+
+    public function setToReplied(Candidate $candidate)
+    {
+        $candidate->status_before_replied = $candidate->status;
+        $candidate->set_to_replied_at = now();
+        $candidate->status = 4;
+        $candidate->is_reply = 1;
+        $candidate->save();
+
+        CandidateSequence::updateOrCreate([
+            'candidate_id' => $candidate->id,
+            'sequence_id' => $this->sequence->id
+        ],[
+            'candidate_sequence_status' => 4
+        ]);
+
+        InsertSgEvents::dispatch([
+          'status' => 'reply',
+          'email' => $candidate->primary_email,
+          'sequence_id' => $this->sequence->id,
+          'step_id' => $candidate->current_step_id,
+          'template_id' => null,
+          'created_at' => now(),
+          'updated_at' => now(),
+          'timestamp' => strtotime('now')
+        ]);
+
+
+        $this->showAlert = true;
+
+        session()->flash('message', candidate_type().' status changed to Replied.');
+    }
+
+    public function setToBounced(Candidate $candidate)
+    {
+        $candidate->status_before_replied = $candidate->status;
+        $candidate->is_reply = 0;
+        $candidate->set_to_replied_at = NULL;
+        $candidate->status = 5;
+        $candidate->save();
+
+        CandidateSequence::updateOrCreate([
+            'candidate_id' => $candidate->id,
+            'sequence_id' => $this->sequence->id
+        ],[
+            'candidate_sequence_status' => 5
+        ]);
+
+        InsertSgEvents::dispatch([
+          'status' => 'bounce',
+          'email' => $candidate->primary_email,
+          'sequence_id' => $this->sequence->id,
+          'step_id' => $candidate->current_step_id,
+          'template_id' => null,
+          'created_at' => now(),
+          'updated_at' => now(),
+          'timestamp' => strtotime('now')
+        ]);
+
+        $this->showAlert = true;
+
+        session()->flash('message', candidate_type().' status changed to Bounced.');
+    }
+
+    public function unSetBounced(Candidate $candidate)
+    {
+        // $candidate->status_before_replied = $candidate->status;
+        $candidate->status = $candidate->status_before_replied;
+        $candidate->save();
+
+        CandidateSequence::updateOrCreate([
+            'candidate_id' => $candidate->id,
+            'sequence_id' => $this->sequence->id
+        ],[
+            'candidate_sequence_status' => $candidate->status
+        ]);
+
+        $this->showAlert = true;
+
+        session()->flash('message', candidate_type().' status reverted to old status.');
+    }
+
+    public function candidateNotes(Candidate $candidate)
+    {
+        $this->selectedCandidate = $candidate;
+        $this->candidateNotes = CandidateNote::where('candidate_id', $this->selectedCandidate->id)->join('users', 'users.id', 'candidate_notes.user_id')->with('user', 'itself')->orderBy('candidate_notes.id', 'asc')->get();
+    }
+
+    public function  candidateNotesClose()
+    {
+        $this->selectedCandidate = null;
+        $this->candidateNotes = [];
+    }
+
+    public function storeNote()
+    {
+        $this->candidateNotes = CandidateNote::where('candidate_id', $this->selectedCandidate->id)->join('users', 'users.id', 'candidate_notes.user_id')->with('user', 'itself')->orderBy('candidate_notes.id', 'asc')->get();
+        $validatedData = $this->validate([
+            'note' => ['required','min:2']
+        ]);
+
+        $CandidateNote = new CandidateNote;
+        $CandidateNote->candidate_id = $this->selectedCandidate->id;
+        $CandidateNote->user_id = currentUser()->id;
+        $CandidateNote->note = $this->note;
+        $CandidateNote->save();
+
+        // $this->candidateNotes = CandidateNote::where('candidate_id', $this->selectedCandidate->id)->join('users', 'users.id', 'candidate_notes.user_id')->with('user', 'itself')->orderBy('candidate_notes.id', 'asc')->get();
+        $this->note = "";
+        $this->selectedCandidate = Candidate::where('candidates.id',$this->selectedCandidate->id)->CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)->first();
+        $this->candidateNotes = CandidateNote::where('candidate_id', $this->selectedCandidate->id)->join('users', 'users.id', 'candidate_notes.user_id')->with('user', 'itself')->orderBy('candidate_notes.id', 'asc')->get();
+        $this->workEmail = CandidateIndentifier::where('candidate_identifier_type', 'email')->where('candidate_identifier_sub_type', 'work')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->workPhone = CandidateIndentifier::where('candidate_identifier_type', 'phone')->where('candidate_identifier_sub_type', 'work')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->personalPhone = CandidateIndentifier::where('candidate_identifier_type', 'phone')->where('candidate_identifier_sub_type', 'personal')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->personalEmail = CandidateIndentifier::where('candidate_identifier_type', 'email')->where('candidate_identifier_sub_type', 'personal')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->selectedCandidateSequences = CandidateSequence::where('candidate_id', $this->selectedCandidate->id)->join('sequences', 'sequences.id', 'candidate_sequences.sequence_id')
+        ->leftjoin('jobs', 'jobs.id', 'sequences.job_id')
+        ->leftjoin('users', 'users.id', 'sequences.user_id')
+        ->select('*', 'users.name as userName', 'jobs.name as jobName')
+        ->with('candidateStatus')
+        ->get();
+
+
+        session()->flash('message', 'Note Created Successfully.');
+    }
+
+    public  function changeNote($value)
+    {
+        $this->note = $value;
+        $this->candidateNotes = CandidateNote::where('candidate_id', $this->selectedCandidate->id)->join('users', 'users.id', 'candidate_notes.user_id')->with('user', 'itself')->orderBy('candidate_notes.id', 'asc')->get();
+    }
+    public function unsetReplied(Candidate $candidate)
+    {
+        $candidate->status = $candidate->status_before_replied ?: 2;
+        $candidate->is_reply = 0;
+        $candidate->status_before_replied = NULL;
+        $candidate->set_to_replied_at = NULL;
+        $candidate->save();
+
+        CandidateSequence::updateOrCreate([
+            'candidate_id' => $candidate->id,
+            'sequence_id' => $this->sequence->id
+        ],[
+            'candidate_sequence_status' => $candidate->status
+        ]);
+
+        $this->showAlert = true;
+
+        session()->flash('message', candidate_type().' replied status unset.');
+    }
+
+    public function setToOngoing(Candidate $candidate)
+    {
+        $candidate->status_before_replied = $candidate->status;
+        $candidate->status = 1;
+        $candidate->is_reply = 0;
+        $candidate->set_to_replied_at = NULL;
+        $candidate->save();
+
+        CandidateSequence::updateOrCreate([
+            'candidate_id' => $candidate->id,
+            'sequence_id' => $this->sequence->id
+        ],[
+            'candidate_sequence_status' => $candidate->status
+        ]);
+
+        $this->showAlert = true;
+
+        session()->flash('message', candidate_type().' status setted to ongoing.');
+    }
+
+
+    public function deleteConfirm(Candidate $candidate)
+    {
+        $this->dispatchBrowserEvent('SwalConfirm',[
+            'title'=> 'Are you sure?',
+            'html'=> 'You want to delete <strong>'.$candidate->primary_email.'</strong>',
+            'id'=> $candidate->id
+        ]);
+    }
+
+    public function delete(Candidate $candidate)
+    {
+        DB::table('candidate_tag')->where('candidate_id',$candidate->id)->delete();
+        DB::table('candidate_folder')->where('candidate_id',$candidate->id)->delete();
+        CandidateSequence::where('candidate_id', $candidate->id)->delete();
+
+        // if ($candidate->delete()) {
+        $this->showAlert = true;
+        $this->checkedCandidates = array_diff($this->checkedCandidates, [$candidate->id]);
+
+        session()->flash('message', candidate_type().' ['.$candidate->first_name.' '.$candidate->last_name.'] deleted successfully.');
+        // }
+    }
+
+    public function deleteCandidates()
+    {
+        $this->dispatchBrowserEvent('swal:deleteCandidates',[
+            'title' => 'Are you sure?',
+            'html' => 'You want to delete the selected '.candidate_type().'(s)',
+            'checkedIDs' => $this->checkedCandidates
+        ]);
+    }
+
+    public function setToReplyCandidates()
+    {
+        $this->dispatchBrowserEvent('swal:setToReplyCandidates',[
+            'title' => 'Are you sure?',
+            'html' => 'You want to set the status to replied',
+            'checkedIDs' => $this->checkedCandidates
+        ]);
+    }
+
+    public function setToOngoingCandidates()
+    {
+        $this->dispatchBrowserEvent('swal:setToOngoingCandidates',[
+            'title' => 'Are you sure?',
+            'html' => 'You want to set the status to ongoing',
+            'checkedIDs' => $this->checkedCandidates
+        ]);
+    }
+
+    public function setToBouncedCandidates()
+    {
+        $this->dispatchBrowserEvent('swal:setToBouncedCandidates',[
+            'title' => 'Are you sure?',
+            'html' => 'You want to set the status to bounced',
+            'checkedIDs' => $this->checkedCandidates
+        ]);
+    }
+
+    public function setToBouncedCandidatesAction($ids)
+    {
+        $Candidates = Candidate::whereIn('id', $ids)->get();
+
+        foreach($Candidates as $key => $Candidate)
+        {
+            $Candidate->is_reply = 0;
+            $Candidate->set_to_replied_at = NULL;
+            $Candidate->status_before_replied = $Candidate->status;
+            $Candidate->status = 5;
+            $Candidate->save();
+
+            $CandidateSequence = CandidateSequence::where('candidate_id', $Candidate->id)->where('sequence_id', $this->sequence->id)->first();
+
+            if($CandidateSequence)
+            {
+                $CandidateSequence->candidate_sequence_status = 5;
+                $CandidateSequence->save();
+            }
+
+            InsertSgEvents::dispatch([
+              'status' => 'bounce',
+              'email' => $Candidate->primary_email,
+              'sequence_id' => $this->sequence->id,
+              'step_id' => $Candidate->current_step_id,
+              'template_id' => null,
+              'created_at' => now(),
+              'updated_at' => now(),
+              'timestamp' => strtotime('now')
+            ]);
+        }
+
+        $this->showAlert = true;
+
+        session()->flash('message', 'Candidate(s) status changed to Bounced.');
+    }
+
+    public function setToOngoingCandidatesAction($ids)
+    {
+        $Candidates = Candidate::whereIn('id', $ids)->get();
+
+        foreach($Candidates as $key => $Candidate)
+        {
+            $Candidate->status_before_replied = $Candidate->status;
+            $Candidate->status = 1;
+            $Candidate->save();
+
+            CandidateSequence::updateOrCreate([
+                'candidate_id' => $Candidate->id,
+                'sequence_id' => $this->sequence->id
+            ],[
+                'candidate_sequence_status' => $Candidate->status
+            ]);
+        }
+
+        $this->showAlert = true;
+
+        session()->flash('message', 'Candidate(s) status changed to Ongoing.');
+    }
+
+    public function multipleEnrich()
+    {
+        foreach($this->checkedCandidates as $key => $candidateID)
+        {
+            EnrichCandidate::dispatch($candidateID,$this->sequence->id,currentUser()->id)->onQueue('enrich');
+        }
+
+        $this->checkedCandidates = [];
+        $this->selectAll = false;
+        $this->selectPage = false;
+        $this->showAlert = true;
+        $this->resetPage();
+
+        session()->flash('message', 'Candidate(s) has been added to enrich queue. Please check again after few minutes');
+    }
+
+    public function setToReplyCandidatesAction($ids)
+    {
+        $Candidates = Candidate::whereIn('id', $ids)->get();
+
+        foreach($Candidates as $key => $Candidate)
+        {
+            $Candidate->status_before_replied = $Candidate->status;
+            $Candidate->set_to_replied_at = now();
+            $Candidate->status = 4;
+            $Candidate->is_reply = 1;
+            $Candidate->save();
+
+            CandidateSequence::updateOrCreate([
+                'candidate_id' => $Candidate->id,
+                'sequence_id' => $this->sequence->id
+            ],[
+                'candidate_sequence_status' => $Candidate->status
+            ]);
+
+            InsertSgEvents::dispatch([
+              'status' => 'reply',
+              'email' => $Candidate->primary_email,
+              'sequence_id' => $this->sequence->id,
+              'step_id' => $Candidate->current_step_id,
+              'template_id' => null,
+              'created_at' => now(),
+              'updated_at' => now(),
+              'timestamp' => strtotime('now')
+            ]);
+        }
+
+        $this->showAlert = true;
+
+        session()->flash('message', 'Candidate(s) status changed to Replied.');
+    }
+
+    public function deleteCheckedCandidates($ids)
+    {
+        DB::table('candidate_tag')->whereIn('candidate_id',$ids)->delete();
+        DB::table('candidate_folder')->whereIn('candidate_id',$ids)->delete();
+        CandidateSequence::whereIn('candidate_id', $ids)->delete();
+        // Candidate::whereKey($ids)->delete();
+
+        $this->checkedCandidates = [];
+        $this->selectAll = false;
+        $this->selectPage = false;
+        $this->showAlert = true;
+        $this->resetPage();
+
+        session()->flash('message', candidate_type().' deleted successfully.');
+    }
+
+    public function updatedSelectPage($value)
+    {
+        if ($value) {
+            $this->checkedCandidates = $this->candidates->pluck('id')->map(fn ($item) => (string) $item)->toArray();
+        } else {
+            $this->checkedCandidates = [];
+        }
+    }
+
+    public function updatedCheckedCandidates()
+    {
+        $this->selectPage = false;
+    }
+
+    public function selectAll()
+    {
+        $this->selectAll = true;
+        $this->checkedCandidates = $this->candidatesQuery->pluck('id')->map(fn ($item) => (string) $item)->toArray();
+    }
+
+    public function prevnext($action = "next")
+    {
+        // dd($this->getCandidatesQueryProperty());
+
+        $candidateNext = null;
+
+        if($action == "next")
+        {
+            $candidateNext = $this->getCandidatesQueryPropertySort()->where('candidates.id', '<', $this->candidate_id)->orderBy('candidates.id', 'DESC')->first();
+        }
+        else
+        {
+            $candidateNext = $this->getCandidatesQueryPropertySort()->where('candidates.id', '>', $this->candidate_id)->orderBy('candidates.id', 'ASC')->first();
+        }
+
+        if($candidateNext)
+        {
+            return $this->edit($candidateNext);
+        }
+        else
+        {
+            return $this->edit($this->selectedCandidate);
+        }
+    }
+    public function edit(Candidate $candidate)
+    {
+        $this->candidate_id = $candidate->id;
+        $this->first_name = $candidate->first_name;
+        $this->last_name = $candidate->last_name;
+        $this->primary_email = $candidate->primary_email;
+        $this->secondary_email = $candidate->secondary_email;
+        $this->phone1 = $candidate->phone1;
+        $this->mobile_num = $candidate->mobile_num;
+        $this->job_title = $candidate->job_title;
+        $this->current_company = $candidate->current_company;
+        $this->sequence_id = $candidate->sequence_id;
+        $this->location = $candidate->location;
+
+        $this->isverified = CandidateIndentifier::where('candidate_identifier_accuracy', 1)->where('candidate_id', $this->candidate_id)->where('candidate_identifier_name', 'primary_email')->first();
+        $this->selectedCandidate = Candidate::where('candidates.id', $this->candidate_id)->CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)->first();
+        $this->candidateNotes = CandidateNote::where('candidate_id', $this->selectedCandidate->id)->join('users', 'users.id', 'candidate_notes.user_id')->with('user', 'itself')->orderBy('candidate_notes.id', 'asc')->get();
+        $this->workEmail = CandidateIndentifier::where('candidate_identifier_type', 'email')->where('candidate_identifier_sub_type', 'work')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->workPhone = CandidateIndentifier::where('candidate_identifier_type', 'phone')->where('candidate_identifier_sub_type', 'work')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->personalPhone = CandidateIndentifier::where('candidate_identifier_type', 'phone')->where('candidate_identifier_sub_type', 'personal')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->personalEmail = CandidateIndentifier::where('candidate_identifier_type', 'email')->where('candidate_identifier_sub_type', 'personal')->where('candidate_id', $this->selectedCandidate->id)->get();
+
+        $this->selectedCandidateSequences = CandidateSequence::where('candidate_id', $this->selectedCandidate->id)->join('sequences', 'sequences.id', 'candidate_sequences.sequence_id')
+        ->leftjoin('jobs', 'jobs.id', 'sequences.job_id')
+        ->leftjoin('users', 'users.id', 'sequences.user_id')
+        ->select('*', 'users.name as userName', 'jobs.name as jobName', 'candidate_sequences.id as id')
+        ->with('candidateStatus')
+        ->get();
+
+        $this->cNow = $this->getCandidatesQueryProperty()->where('candidates.id', '>=', $this->candidate_id)->count();
+        $this->cTotal = $this->getCandidatesQueryProperty()->count();
+    }
+
+    public function updateEmail($candidate_identifier_id)
+    {
+        $CandidateIndentifierSelected = CandidateIndentifier::where('id', $candidate_identifier_id)->first();
+        $update['candidate_identifier_name'] = $CandidateIndentifierSelected->candidate_identifier_type == 'email' ? 'additional_email' : 'additional_phone';
+        CandidateIndentifier::where('candidate_identifier_type', $CandidateIndentifierSelected->candidate_identifier_type)->where('candidate_identifier_sub_type', $CandidateIndentifierSelected->candidate_identifier_sub_type)->where('candidate_id', $this->selectedCandidate->id)->update($update);
+        $updateNewPrimary['candidate_identifier_name'] = $CandidateIndentifierSelected->candidate_identifier_type == 'email' ? 'primary_email' : 'primary_phone';
+        CandidateIndentifier::where('id', $candidate_identifier_id)->update($updateNewPrimary);
+        $newPrimary = CandidateIndentifier::where('id', $candidate_identifier_id)->first();
+        $updateCandidate['primary_email'] = $newPrimary->candidate_identifier_value;
+
+        if(currentUser()->hasRole('Recruiter'))
+        {
+            if($CandidateIndentifierSelected->candidate_identifier_sub_type == 'personal')
+            {
+                Candidate::where('id', $this->selectedCandidate->id)->update($updateCandidate);
+            }
+        }
+        else
+        {
+            if($CandidateIndentifierSelected->candidate_identifier_sub_type == 'work')
+            {
+                Candidate::where('id', $this->selectedCandidate->id)->update($updateCandidate);
+            }
+        }
+
+
+
+        if($CandidateIndentifierSelected->candidate_identifier_type == 'email')
+        {
+            $updateCandidateSequnce['candidate_sequence_status'] = 1;
+            $updateCandidateSequnce['candidate_sequence_current_step'] = null;
+            $updateCandidateSequnce['candidate_sequence_current_step_id'] = null;
+
+            $checkStep = SgEvent::where('email', $newPrimary->candidate_identifier_value)->join('steps', 'steps.id', 'sg_events.step_id')->where('sg_events.status', 'message')->where('sg_events.sequence_id', $this->sequence->id)->first();
+
+            if($checkStep)
+            {
+                $updateCandidateSequnce['candidate_sequence_status'] = 2;
+                $updateCandidateSequnce['candidate_sequence_current_step'] = $checkStep->order;
+                $updateCandidateSequnce['candidate_sequence_current_step_id'] = $checkStep->step_id;
+
+                $checkLastStatus = SgEvent::where('email', $newPrimary->candidate_identifier_value)->join('steps', 'steps.id', 'sg_events.step_id')->where('sg_events.sequence_id', $this->sequence->id)->orderBy('sg_events.id', 'DESC')->first();
+
+                if($checkLastStatus)
+                {
+                    switch($checkLastStatus->status){
+                        case 'open':
+                            $updateCandidateSequnce['candidate_sequence_status'] = 3;
+                        break;
+                        case 'bounce':
+                            $updateCandidateSequnce['candidate_sequence_status'] = 4;
+                        break;
+                        case 'reply':
+                            $updateCandidateSequnce['candidate_sequence_status'] = 5;
+                        break;
+                    }
+                }
+            }
+            Candidate::where('candidates.id', $this->candidate_id)->update([ 'primary_email' => $newPrimary->candidate_identifier_value]);
+            CandidateSequence::where('candidate_id', $this->selectedCandidate->id)->where('sequence_id', $this->sequence->id)->update($updateCandidateSequnce);
+        }
+
+
+        $this->isverified = CandidateIndentifier::where('candidate_identifier_accuracy', 1)->where('candidate_id', $this->candidate_id)->where('candidate_identifier_name', 'primary_email')->first();
+        $this->selectedCandidate = Candidate::where('candidates.id', $this->candidate_id)->CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)->first();
+        $this->candidateNotes = CandidateNote::where('candidate_id', $this->selectedCandidate->id)->join('users', 'users.id', 'candidate_notes.user_id')->with('user', 'itself')->orderBy('candidate_notes.id', 'asc')->get();
+        $this->workEmail = CandidateIndentifier::where('candidate_identifier_type', 'email')->where('candidate_identifier_sub_type', 'work')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->workPhone = CandidateIndentifier::where('candidate_identifier_type', 'phone')->where('candidate_identifier_sub_type', 'work')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->personalPhone = CandidateIndentifier::where('candidate_identifier_type', 'phone')->where('candidate_identifier_sub_type', 'personal')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->personalEmail = CandidateIndentifier::where('candidate_identifier_type', 'email')->where('candidate_identifier_sub_type', 'personal')->where('candidate_id', $this->selectedCandidate->id)->get();
+
+        $this->selectedCandidateSequences = CandidateSequence::where('candidate_id', $this->selectedCandidate->id)->join('sequences', 'sequences.id', 'candidate_sequences.sequence_id')
+        ->leftjoin('jobs', 'jobs.id', 'sequences.job_id')
+        ->leftjoin('users', 'users.id', 'sequences.user_id')
+        ->select('*', 'users.name as userName', 'jobs.name as jobName', 'candidate_sequences.id as id')
+        ->with('candidateStatus')
+        ->get();
+    }
+
+    public function enrichPipl()
+    {
+
+        $LinkInedLink = CandidateIndentifier::where('candidate_id', $this->selectedCandidate->id)->where('candidate_identifier_type', 'linkedin')->first();
+
+        if($LinkInedLink)
+        {
+            $Pipl = new Pipl;
+            $PiplData = $Pipl->enrich($LinkInedLink->candidate_identifier_value);
+            $enriched = $Pipl->saveToDb($PiplData, $this->selectedCandidate->id);
+
+            $candidate_identifier_sub_type = currentUser()->hasRole('Recruiter') ? 'work' : 'personal';
+
+            $newPrimary = CandidateIndentifier::where('candidate_identifier_sub_type', $candidate_identifier_sub_type)->where('candidate_identifier_name', 'primary_email')->where('candidate_id', $this->selectedCandidate->id)->first();
+
+            if($newPrimary)
+            {
+                $updateCandidate['primary_email'] = $newPrimary->candidate_identifier_value;
+                Candidate::where('id', $this->selectedCandidate->id)->update($updateCandidate);
+
+                $updateCandidateSequnce['candidate_sequence_status'] = 1;
+                $updateCandidateSequnce['candidate_sequence_current_step'] = null;
+                $updateCandidateSequnce['candidate_sequence_current_step_id'] = null;
+
+                $checkStep = SgEvent::where('email', $newPrimary->candidate_identifier_value)->join('steps', 'steps.id', 'sg_events.step_id')->where('sg_events.status', 'message')->where('sg_events.sequence_id', $this->sequence->id)->first();
+
+                if($checkStep)
+                {
+                    $updateCandidateSequnce['candidate_sequence_status'] = 2;
+                    $updateCandidateSequnce['candidate_sequence_current_step'] = $checkStep->order;
+                    $updateCandidateSequnce['candidate_sequence_current_step_id'] = $checkStep->step_id;
+
+                    $checkLastStatus = SgEvent::where('email', $newPrimary->candidate_identifier_value)->join('steps', 'steps.id', 'sg_events.step_id')->where('sg_events.sequence_id', $this->sequence->id)->orderBy('sg_events.id', 'DESC')->first();
+
+                    if($checkLastStatus)
+                    {
+                        switch($checkLastStatus->status){
+                            case 'open':
+                                $updateCandidateSequnce['candidate_sequence_status'] = 3;
+                            break;
+                            case 'bounce':
+                                $updateCandidateSequnce['candidate_sequence_status'] = 4;
+                            break;
+                            case 'reply':
+                                $updateCandidateSequnce['candidate_sequence_status'] = 5;
+                            break;
+                        }
+                    }
+                }
+
+
+            }
+        }
+
+        $updateCandidateSequnce['candidate_sequence_enriched'] = 1;
+        $updateCandidateSequnce['candidate_sequence_enrich_user'] = currentUser()->id;
+        $updateCandidateSequnce['candidate_sequence_date'] = Carbon::now();
+
+        CandidateSequence::where('candidate_id', $this->selectedCandidate->id)->where('sequence_id', $this->sequence->id)->update($updateCandidateSequnce);
+
+        $this->isverified = CandidateIndentifier::where('candidate_identifier_accuracy', 1)->where('candidate_id', $this->candidate_id)->where('candidate_identifier_name', 'primary_email')->first();
+        $this->selectedCandidate = Candidate::where('candidates.id', $this->candidate_id)->CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)->first();
+        $this->candidateNotes = CandidateNote::where('candidate_id', $this->selectedCandidate->id)->join('users', 'users.id', 'candidate_notes.user_id')->with('user', 'itself')->orderBy('candidate_notes.id', 'asc')->get();
+        $this->workEmail = CandidateIndentifier::where('candidate_identifier_type', 'email')->where('candidate_identifier_sub_type', 'work')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->workPhone = CandidateIndentifier::where('candidate_identifier_type', 'phone')->where('candidate_identifier_sub_type', 'work')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->personalPhone = CandidateIndentifier::where('candidate_identifier_type', 'phone')->where('candidate_identifier_sub_type', 'personal')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->personalEmail = CandidateIndentifier::where('candidate_identifier_type', 'email')->where('candidate_identifier_sub_type', 'personal')->where('candidate_id', $this->selectedCandidate->id)->get();
+
+        $this->selectedCandidateSequences = CandidateSequence::where('candidate_id', $this->selectedCandidate->id)->join('sequences', 'sequences.id', 'candidate_sequences.sequence_id')
+        ->leftjoin('jobs', 'jobs.id', 'sequences.job_id')
+        ->leftjoin('users', 'users.id', 'sequences.user_id')
+        ->select('*', 'users.name as userName', 'jobs.name as jobName', 'candidate_sequences.id as id')
+        ->with('candidateStatus')
+        ->get();
+    }
+
+    public function setAccuracy($candidate_identifier_id, $status)
+    {
+        $CandidateIndentifierSelected = CandidateIndentifier::where('id', $candidate_identifier_id)->first();
+        $CandidateIndentifierSelected->candidate_identifier_accuracy = $status;
+        $CandidateIndentifierSelected->candidate_identifier_accuracy_date = Carbon::now();
+        $CandidateIndentifierSelected->candidate_identifier_accuracy_user = currentUser()->id;
+        $CandidateIndentifierSelected->save();
+
+        if($CandidateIndentifierSelected->candidate_identifier_name == 'primary_email' || $CandidateIndentifierSelected->candidate_identifier_name == 'primary_phone')
+        {
+            if( $status == 2)
+            {
+                $identiFier = $CandidateIndentifierSelected->candidate_identifier_name == 'primary_email' ? 'email' : 'phone';
+                $CandidateIndentifierSelected->candidate_identifier_name = 'additional_' . $identiFier;
+                $CandidateIndentifierSelected->save();
+
+                $newPrimary = CandidateIndentifier::whereIn('candidate_identifier_name', ['additional_' . $identiFier, 'secondary_' . $identiFier])
+                ->where('candidate_id', $CandidateIndentifierSelected->candidate_id)
+                ->whereIn('candidate_identifier_accuracy', [0, 1])
+                ->where('candidate_identifier_sub_type', $CandidateIndentifierSelected->candidate_identifier_sub_type)
+                ->where('candidate_identifier_type', $CandidateIndentifierSelected->candidate_identifier_type)
+                ->first();
+
+                if($newPrimary)
+                {
+                    $newPrimary->candidate_identifier_name = 'primary_' . $identiFier;
+                    $newPrimary->save();
+
+                    if($identiFier == 'email')
+                    {
+                        $updateCandidateSequnce['candidate_sequence_status'] = 1;
+                        $updateCandidateSequnce['candidate_sequence_current_step'] = null;
+                        $updateCandidateSequnce['candidate_sequence_current_step_id'] = null;
+
+                        $checkStep = SgEvent::where('email', $newPrimary->candidate_identifier_value)->join('steps', 'steps.id', 'sg_events.step_id')->where('sg_events.status', 'message')->where('sg_events.sequence_id', $this->sequence->id)->first();
+
+                        if($checkStep)
+                        {
+                            $updateCandidateSequnce['candidate_sequence_status'] = 2;
+                            $updateCandidateSequnce['candidate_sequence_current_step'] = $checkStep->order;
+                            $updateCandidateSequnce['candidate_sequence_current_step_id'] = $checkStep->step_id;
+
+                            $checkLastStatus = SgEvent::where('email', $newPrimary->candidate_identifier_value)->join('steps', 'steps.id', 'sg_events.step_id')->where('sg_events.sequence_id', $this->sequence->id)->orderBy('sg_events.id', 'DESC')->first();
+
+                            if($checkLastStatus)
+                            {
+                                switch($checkLastStatus->status){
+                                    case 'open':
+                                        $updateCandidateSequnce['candidate_sequence_status'] = 3;
+                                    break;
+                                    case 'bounce':
+                                        $updateCandidateSequnce['candidate_sequence_status'] = 4;
+                                    break;
+                                    case 'reply':
+                                        $updateCandidateSequnce['candidate_sequence_status'] = 5;
+                                    break;
+                                }
+                            }
+                        }
+                        Candidate::where('candidates.id', $this->candidate_id)->update([ 'primary_email' => $newPrimary->candidate_identifier_value]);
+                        CandidateSequence::where('candidate_id', $this->selectedCandidate->id)->where('sequence_id', $this->sequence->id)->update($updateCandidateSequnce);
+                    }
+                }
+                else
+                {
+                    $updateCandidateSequnce['candidate_sequence_status'] = 10;
+                    $updateCandidateSequnce['candidate_sequence_action'] = "No Available email because of data accuracy";
+                    CandidateSequence::where('candidate_id', $this->selectedCandidate->id)->where('sequence_id', $this->sequence->id)->update($updateCandidateSequnce);
+                }
+            }
+
+        }
+
+        $this->isverified = CandidateIndentifier::where('candidate_identifier_accuracy', 1)->where('candidate_id', $this->candidate_id)->where('candidate_identifier_name', 'primary_email')->first();
+        $this->selectedCandidate = Candidate::where('candidates.id', $this->candidate_id)->CandidateSequence()->where('candidate_sequences.sequence_id', $this->sequence->id)->first();
+        $this->candidateNotes = CandidateNote::where('candidate_id', $this->selectedCandidate->id)->join('users', 'users.id', 'candidate_notes.user_id')->with('user', 'itself')->orderBy('candidate_notes.id', 'asc')->get();
+        $this->workEmail = CandidateIndentifier::where('candidate_identifier_type', 'email')->where('candidate_identifier_sub_type', 'work')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->workPhone = CandidateIndentifier::where('candidate_identifier_type', 'phone')->where('candidate_identifier_sub_type', 'work')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->personalPhone = CandidateIndentifier::where('candidate_identifier_type', 'phone')->where('candidate_identifier_sub_type', 'personal')->where('candidate_id', $this->selectedCandidate->id)->get();
+        $this->personalEmail = CandidateIndentifier::where('candidate_identifier_type', 'email')->where('candidate_identifier_sub_type', 'personal')->where('candidate_id', $this->selectedCandidate->id)->get();
+
+        $this->selectedCandidateSequences = CandidateSequence::where('candidate_id', $this->selectedCandidate->id)->join('sequences', 'sequences.id', 'candidate_sequences.sequence_id')
+        ->leftjoin('jobs', 'jobs.id', 'sequences.job_id')
+        ->leftjoin('users', 'users.id', 'sequences.user_id')
+        ->select('*', 'users.name as userName', 'jobs.name as jobName', 'candidate_sequences.id as id')
+        ->with('candidateStatus')
+        ->get();
+    }
+    public function update()
+    {
+        $validatedData = $this->validate([
+            'first_name' => ['required','min:2'],
+            'last_name' => ['required','min:2'],
+            'primary_email' => ['required','email','unique:candidates,primary_email,'.$this->candidate_id.',id,sequence_id,'.$this->sequence_id]
+        ]);
+
+        $candidate = Candidate::where('id',$this->candidate_id)->first();
+        $candidate->update([
+                'first_name' => $this->first_name,
+                'last_name' => $this->last_name,
+                'primary_email' => $this->primary_email,
+                'secondary_email' => $this->secondary_email,
+                'phone1' => $this->phone1,
+                'mobile_num' => $this->mobile_num,
+                'job_title' => $this->job_title,
+                'current_company' => $this->current_company,
+                'location' => $this->location,
+                'sequence_id' => $this->sequence_id
+            ]);
+
+        if($this->primary_email)
+        {
+            $tempIdentifier = [
+                'candidate_id' => $candidate->id,
+                'candidate_identifier_value' => $this->primary_email,
+                'candidate_identifier_name' => 'primary_email'
+            ];
+            CandidateIndentifier::updateOrCreate(['candidate_identifier_value' => $this->primary_email], $tempIdentifier);
+        }
+
+        if($this->secondary_email)
+        {
+            $tempIdentifier = [
+                'candidate_id' => $candidate->id,
+                'candidate_identifier_value' => $this->secondary_email,
+                'candidate_identifier_name' => 'secondary_email'
+            ];
+            CandidateIndentifier::updateOrCreate(['candidate_identifier_value' => $this->secondary_email], $tempIdentifier);
+        }
+
+        $this->resetInputFields();
+        $this->showAlert = true;
+
+        session()->flash('message', candidate_type().' Updated Successfully.');
+
+        $this->emit('closeEditCandidateModal');
+    }
+}
